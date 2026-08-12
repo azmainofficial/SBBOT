@@ -1,0 +1,11 @@
+edge-tts>=6.1.9
+sounddevice>=0.4.6
+scipy>=1.10.0
+python-dotenv>=1.0.1
+requests>=2.31.0
+numpy>=1.24.0
+SpeechRecognition>=3.10.4
+pygame>=2.5.0
+# Bug Fix #9: Missing packages for live_assistant.py — google-genai and pyaudio
+google-genai>=1.0.0
+pyaudio>=0.2.13

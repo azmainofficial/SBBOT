@@ -1,0 +1,15 @@
+# Python environment
+robot_env/
+venv/
+__pycache__/
+*.pyc
+
+# Temporary Audio files
+input.wav
+output.mp3
+response.wav
+temp_audio/
+
+# Environment Keys (NEVER commit — contains API keys)
+.env
+pi.txt
