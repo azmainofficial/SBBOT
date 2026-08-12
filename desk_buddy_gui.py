@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import math
 import time
@@ -201,6 +201,15 @@ class DeskBuddyGUI:
         pulse  = int(math.sin(self.flag_pulse) * 2)
         pygame.draw.circle(self.screen, BD_RED, (int(self.sw * 0.05), bar_h // 2), disc_r + pulse)
         pygame.draw.circle(self.screen, BD_RED, (int(self.sw * 0.95), bar_h // 2), disc_r + pulse)
+
+        # Draw a clear red Exit [X] button on the top-right for touchscreen/mouse close
+        self.exit_btn_rect = pygame.Rect(self.sw - int(self.sw * 0.08) - 10, int(bar_h * 0.15), int(self.sw * 0.08), int(bar_h * 0.7))
+        pygame.draw.rect(self.screen, BD_RED_DIM, self.exit_btn_rect, border_radius=6)
+        pygame.draw.rect(self.screen, BD_WHITE, self.exit_btn_rect, width=1, border_radius=6)
+        exit_lbl = self.font_badge.render("EXIT [X]", True, BD_WHITE)
+        self.screen.blit(exit_lbl, (self.exit_btn_rect.centerx - exit_lbl.get_width() // 2,
+                                     self.exit_btn_rect.centery - exit_lbl.get_height() // 2))
+
 
     def _draw_badge(self):
         labels = {
@@ -415,6 +424,12 @@ class DeskBuddyGUI:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:  # Left click / touchscreen tap
+                    pos = pygame.mouse.get_pos()
+                    if hasattr(self, 'exit_btn_rect') and self.exit_btn_rect.collidepoint(pos):
+                        print("[GUI] Exit button clicked. Exiting ShongiBot...")
+                        self.running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     self.running = False
