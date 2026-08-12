@@ -21,6 +21,7 @@ REMOTE_DIR = "/home/sb/SongiBot"
 FILES_TO_PUSH = [
     "api_robot.py",
     "desk_buddy_gui.py",
+    "run_gui.sh",
     ".env",
     ".env.example",
     ".gitignore",
@@ -88,25 +89,50 @@ def main():
         req_out = stdout.read().decode('utf-8', errors='ignore')
         print(req_out if req_out else "Requirements check completed.")
 
-        # Enable and restart systemd robot service for auto-start on boot
-        print("\n[AUTO-BOOT] Enabling & restarting robot.service on Raspberry Pi...")
-        client.exec_command(f"echo {PI_PASS} | sudo -S systemctl daemon-reload")
-        client.exec_command(f"echo {PI_PASS} | sudo -S systemctl enable robot.service")
-        stdin, stdout, stderr = client.exec_command(f"echo {PI_PASS} | sudo -S systemctl restart robot.service")
-        err = stderr.read().decode('utf-8', errors='ignore')
-        if "Password:" in err or err.strip() == "":
-            print("[OK] Service restart signal sent.")
-        else:
-            print(f"[INFO] Service output: {err.strip()}")
+        # 1. Disable boot run (robot.service) so it does not auto-start on boot
+        print("\n[DISABLE-BOOT] Disabling and stopping robot.service...")
+        client.exec_command(f"echo {PI_PASS} | sudo -S systemctl stop robot.service")
+        client.exec_command(f"echo {PI_PASS} | sudo -S systemctl disable robot.service")
 
-        # Check status of robot.service
-        stdin, stdout, stderr = client.exec_command("systemctl status robot.service --no-pager -l")
-        status_out = stdout.read().decode('utf-8', errors='ignore')
-        print("\n[STATUS] robot.service status on Pi:")
-        print(status_out if status_out else "Service status unavailable.")
+        # 2. Disable ~/.config/autostart/shongibot.desktop if exists
+        print("[DISABLE-AUTOSTART] Removing autostart entry if exists...")
+        client.exec_command("rm -f /home/sb/.config/autostart/shongibot.desktop")
+
+        # 3. Make run_gui.sh executable
+        print("[EXEC] Marking run_gui.sh executable...")
+        client.exec_command(f"chmod +x {REMOTE_DIR}/run_gui.sh")
+
+        # 4. Create Desktop launcher ShongiBot.desktop on Raspberry Pi Desktop
+        print("[DESKTOP] Creating Desktop launcher ShongiBot.desktop...")
+        client.exec_command("mkdir -p /home/sb/Desktop")
+
+        desktop_entry = """[Desktop Entry]
+Type=Application
+Name=ShongiBot
+Comment=Launch ShongiBot (Bangladesh Culture Guide)
+Exec=/home/sb/SongiBot/run_gui.sh
+Icon=utilities-terminal
+Terminal=true
+Categories=Utility;Development;
+Path=/home/sb/SongiBot
+"""
+        sftp = client.open_sftp()
+        try:
+            with sftp.file("/home/sb/Desktop/ShongiBot.desktop", "w") as f:
+                f.write(desktop_entry)
+            print("[OK] ShongiBot.desktop created on Desktop!")
+        except Exception as e:
+            print(f"[WARNING] Failed to write Desktop shortcut: {e}")
+        sftp.close()
+
+        # 5. Make the Desktop shortcut executable
+        client.exec_command("chmod +x /home/sb/Desktop/ShongiBot.desktop")
+        # For Raspberry Pi OS Desktop (LXDE/Wayfire), mark it as trusted
+        client.exec_command("gio set /home/sb/Desktop/ShongiBot.desktop metadata::trusted true >/dev/null 2>&1 || true")
 
         client.close()
-        print("\n[SUCCESS] Deployment completed successfully!")
+        print("\n[SUCCESS] Deployment & Desktop Shortcut configuration completed successfully!")
+
 
     except Exception as e:
         print(f"\n[ERROR] Deployment error: {e}")
