@@ -3,6 +3,8 @@ import sys
 import time
 import asyncio
 import subprocess
+import threading
+import queue
 import requests
 import sounddevice as sd
 from scipy.io.wavfile import write
@@ -254,14 +256,16 @@ def get_ai_response(user_text, system_prompt):
             return "দুঃখিত, এপিআই-তে কোনো সমস্যা হয়েছে।"
 
 
-async def text_to_speech(text):
+async def text_to_speech(text, output_path=None):
     """Generates neural voice output using Microsoft Edge-TTS."""
+    if output_path is None:
+        output_path = RESPONSE_AUDIO
     # Detect if the generated text contains Bengali characters to select the correct voice
     has_bengali = any(0x0980 <= ord(char) <= 0x09FF for char in text)
     voice = "bn-BD-NabanitaNeural" if has_bengali else "en-US-EmmaNeural"
-    
+
     communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(RESPONSE_AUDIO)
+    await communicate.save(output_path)
 
 def update_gui(state, user_text="", robot_text=""):
     """Helper to update Desk Buddy GUI state across threads."""
@@ -272,128 +276,234 @@ def update_gui(state, user_text="", robot_text=""):
     except Exception:
         pass
 
+
+# ─── Concurrent Pipeline ───────────────────────────────────────────────────────
+# audio_queue: recorder thread → processor thread
+# Each item is a numpy int16 array of the recorded utterance.
+audio_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
+
+# Shared flag: True while the bot is playing a response.
+# Recorder checks this to avoid capturing the bot's own voice.
+is_speaking = threading.Event()
+
+
+def recorder_worker(has_mic: bool):
+    """
+    Thread-1: Continuously listens for speech and pushes audio arrays
+    into audio_queue. Runs independently from the processor.
+    """
+    print("🎙️  [Recorder] Pipeline recorder started.")
+    while True:
+        try:
+            if not has_mic:
+                # No mic — text mode handled entirely in processor
+                time.sleep(0.5)
+                continue
+
+            # Wait while bot is speaking to avoid self-echo
+            while is_speaking.is_set():
+                time.sleep(0.05)
+
+            update_gui("LISTENING")
+            rms_energy = record_audio(max_duration=10, silence_timeout=0.8)
+
+            if rms_energy <= 0.0:
+                update_gui("IDLE")
+                time.sleep(0.05)
+                continue
+
+            # Load the audio that was just saved by record_audio()
+            try:
+                from scipy.io.wavfile import read as wav_read
+                _, audio_arr = wav_read(AUDIO_FILE)
+                # Put a copy into the queue (non-blocking — drop if full)
+                audio_queue.put_nowait(audio_arr.copy())
+                print("🎤  [Recorder] Audio captured → queued for processing.")
+            except queue.Full:
+                print("⚠️  [Recorder] Queue full — dropping utterance (processor busy).")
+            except Exception as e:
+                print(f"❌  [Recorder] Audio read error: {e}")
+
+        except Exception as e:
+            print(f"❌  [Recorder] Error: {e}")
+            time.sleep(0.2)
+
+
+def processor_worker(system_prompt: str, has_mic: bool):
+    """
+    Thread-2: Pulls audio arrays from audio_queue, runs STT → AI → TTS → play.
+    Runs concurrently with the recorder so recording continues during AI processing.
+    """
+    print("🧠  [Processor] Pipeline processor started.")
+    turn_index = 0
+
+    while True:
+        try:
+            if not has_mic:
+                # Text-input fallback when no microphone
+                if sys.stdin.isatty():
+                    user_text = input("\n👉 Type your message: ").strip()
+                    if not user_text:
+                        continue
+                else:
+                    time.sleep(10)
+                    continue
+            else:
+                # Block until recorder puts an audio chunk in the queue
+                try:
+                    audio_arr = audio_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+
+                # Step B: Save array to temp WAV and transcribe
+                turn_wav = f"input_turn_{turn_index % 4}.wav"
+                write(turn_wav, SAMPLE_RATE, audio_arr)
+
+                update_gui("THINKING")
+                # Temporarily swap AUDIO_FILE path for transcription
+                orig = globals().get("AUDIO_FILE", "input.wav")
+                import builtins
+                # Transcribe from the per-turn file
+                try:
+                    import speech_recognition as sr
+                    r = sr.Recognizer()
+                    print("⚡  [Processor] Transcribing...")
+                    with sr.AudioFile(turn_wav) as source:
+                        audio = r.record(source)
+                    user_text = ""
+                    try:
+                        user_text = r.recognize_google(audio, language="bn-BD")
+                    except sr.UnknownValueError:
+                        pass
+                    if not user_text:
+                        try:
+                            user_text = r.recognize_google(audio, language="en-US")
+                        except sr.UnknownValueError:
+                            pass
+                except Exception as e:
+                    print(f"❌  [Processor] STT error: {e}")
+                    user_text = ""
+
+                if not user_text:
+                    print("❓  [Processor] Nothing transcribed — discarding.")
+                    update_gui("IDLE")
+                    audio_queue.task_done()
+                    continue
+
+            print(f"🗣️  User: {user_text}")
+            update_gui("THINKING", user_text=user_text)
+
+            # Step C: AI response
+            provider_name = "Groq" if API_PROVIDER == "groq" else "Grok"
+            print(f"🧠  [Processor] Querying {provider_name} ({MODEL})...")
+            ai_response = get_ai_response(user_text, system_prompt)
+            print(f"🤖  ShongiBot: {ai_response}")
+            update_gui("SPEAKING", user_text=user_text, robot_text=ai_response)
+
+            # Step D: TTS — use per-turn output file to avoid racing with next turn
+            response_file = f"output_turn_{turn_index % 4}.mp3"
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        pool.submit(asyncio.run, text_to_speech(ai_response, response_file)).result()
+                else:
+                    loop.run_until_complete(text_to_speech(ai_response, response_file))
+            except RuntimeError:
+                asyncio.run(text_to_speech(ai_response, response_file))
+
+            # Step E: Play — signal recorder to pause during playback
+            is_speaking.set()
+            play_audio(response_file)
+            time.sleep(0.4)
+            is_speaking.clear()   # ← recorder resumes immediately after playback
+
+            update_gui("IDLE", user_text=user_text, robot_text=ai_response)
+            turn_index += 1
+
+            if has_mic:
+                audio_queue.task_done()
+
+        except KeyboardInterrupt:
+            print("\n[Processor] Stopping...")
+            break
+        except Exception as e:
+            print(f"❌  [Processor] Error: {e}")
+            time.sleep(0.1)
+
+
 def main():
-    print("=" * 50)
+    print("=" * 55)
     provider_name = "Groq" if API_PROVIDER == "groq" else "Grok"
-    print(f"🤖 ShongiBot {provider_name} Engine Active! (Model: {MODEL})")
-    print("=" * 50)
+    print(f"🤖 ShongiBot {provider_name} Concurrent Pipeline Active! (Model: {MODEL})")
+    print("   Thread-1 records  ──→  Queue  ──→  Thread-2 answers")
+    print("=" * 55)
 
 
     system_prompt = os.getenv(
         "SYSTEM_PROMPT",
         (
-            "You are ShongiBot — a warm, knowledgeable, and conversational AI voice assistant "
+            "You are ShongiBot \u2014 a warm, knowledgeable, and conversational AI voice assistant "
             "built to celebrate and share Bangladeshi culture, history, and heritage.\n\n"
             "IDENTITY:\n"
             "- You are a proud Bangladeshi culture guide who loves talking about Bangladesh.\n"
             "- Topics: festivals (Eid, Pohela Boishakh, Durga Puja), traditional foods "
             "(biryani, hilsa fish, pitha, mishti doi), music (Rabindra Sangeet, Baul, folk), "
             "history (Liberation War 1971, ancient Bengal, Mughal era), geography "
-            "(Sundarbans, Cox's Bazar, Padma River), arts (Jamdani, Nakshi Kantha), "
-            "and everyday Bangladeshi life and customs.\n"
-            "- You also answer general knowledge questions if asked.\n\n"
+            "(Sundarbans, Cox\u2019s Bazar, Padma River), arts (Jamdani, Nakshi Kantha), "
+            "and everyday Bangladeshi life and customs.\n\n"
             "LANGUAGE RULES (CRITICAL):\n"
-            "- If the user speaks in Bangla → reply in Bangla ONLY.\n"
-            "- If the user speaks in English → reply in English ONLY.\n"
-            "- NEVER use any language other than Bangla or English — not Hindi, Arabic, French, or any other.\n\n"
+            "- If the user speaks in Bangla \u2192 reply in Bangla ONLY.\n"
+            "- If the user speaks in English \u2192 reply in English ONLY.\n"
+            "- NEVER use any language other than Bangla or English.\n\n"
             "CREATOR RULE:\n"
-            "- ONLY if someone explicitly asks who made you or who your creators are, reply: "
-            "'আমাকে তৈরি করেছে টিম সার্কিট ব্রেকার্স (Team Circuit Breakers) — মাহির, ওয়াদী, এবং ওমর।'\n"
+            "- ONLY if someone explicitly asks who made you, reply: "
+            "'\u0986\u09ae\u09be\u0995\u09c7 \u09a4\u09c8\u09b0\u09bf \u0995\u09b0\u09c7\u099b\u09c7 \u099f\u09bf\u09ae \u09b8\u09be\u09b0\u09cd\u0995\u09bf\u099f \u09ac\u09cd\u09b0\u09c7\u0995\u09be\u09b0\u09cd\u09b8 (Team Circuit Breakers) \u2014 \u09ae\u09be\u09b9\u09bf\u09b0, \u0993\u09af\u09bc\u09be\u09a6\u09c0, \u098f\u09ac\u0982 \u0993\u09ae\u09b0\u0964'\n"
             "- Do NOT bring up your creators otherwise.\n\n"
             "VOICE STYLE:\n"
-            "- Keep responses short and natural — 1 to 3 sentences unless more detail is requested.\n"
-            "- Do NOT use bullet points, asterisks, hashtags, or markdown formatting.\n"
-            "- Speak as if having a friendly conversation, not reading a textbook.\n"
-            "- Use warm and encouraging language."
+            "- Keep responses short \u2014 1 to 3 sentences. No bullet points or markdown."
         )
     ).strip("'\" ")
 
-    # Bug Fix #2: Correctly detect if any microphone/input device is available
+    # Mic detection
     has_mic = False
     try:
         devices = sd.query_devices()
-        input_devs = [
-            d for d in devices
-            if d.get('max_input_channels', 0) > 0
-        ]
-        if input_devs:
-            has_mic = True
-        else:
-            has_mic = False
+        input_devs = [d for d in devices if d.get('max_input_channels', 0) > 0]
+        has_mic = bool(input_devs)
     except Exception:
-        # If sounddevice itself fails, assume mic present to avoid false text-mode
         has_mic = True
 
     if not has_mic:
-        print("⚠️ Warning: No audio input device (microphone) detected.")
-        print("👉 Falling back to Text Input mode. You can type your questions, and ShongiBot will speak the response!")
+        print("\u26a0\ufe0f  No microphone detected \u2014 falling back to text input mode.")
 
     update_gui("IDLE")
 
-    while True:
-        try:
-            user_text = ""
-            
-            if not has_mic:
-                if sys.stdin.isatty():
-                    user_text = input("\n👉 Type your message: ").strip()
-                    if not user_text:
-                        continue
-                else:
-                    print("Running in headless mode without microphone.")
-                    time.sleep(10)
-                    continue
-            else:
-                if not ALWAYS_ON_MIC and sys.stdin.isatty():
-                    input("\n👉 Press ENTER to start talking (or Ctrl+C to exit)...")
+    # ── Launch concurrent pipeline threads ──────────────────────────────────
+    rec_thread = threading.Thread(
+        target=recorder_worker,
+        args=(has_mic,),
+        name="ShongiBot-Recorder",
+        daemon=True
+    )
+    proc_thread = threading.Thread(
+        target=processor_worker,
+        args=(system_prompt, has_mic),
+        name="ShongiBot-Processor",
+        daemon=True
+    )
 
-                # Step A: Dynamic Voice Activity Detection & Recording
-                update_gui("LISTENING")
-                rms_energy = record_audio(max_duration=10, silence_timeout=0.8)
-                if rms_energy <= 0.0:
-                    update_gui("IDLE")
-                    time.sleep(0.1)
-                    continue
+    rec_thread.start()
+    proc_thread.start()
+    print("\u2705  Both pipeline threads running. Ctrl+C to exit.")
 
-                # Step B: Speech-to-Text
-                update_gui("THINKING")
-                user_text = transcribe_audio()
-                if not user_text:
-                    print("❓ No speech transcribed. Listening again...")
-                    update_gui("IDLE")
-                    continue
+    try:
+        while rec_thread.is_alive() and proc_thread.is_alive():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n\U0001f6d1 ShongiBot shutting down...")
 
-            print(f"🗣️ User: {user_text}")
-            update_gui("THINKING", user_text=user_text)
-
-            # Step C: LLM Brain via AI Provider
-            provider_name = "Groq" if API_PROVIDER == "groq" else "Grok"
-            print(f"🧠 Processing response via {provider_name} ({MODEL})...")
-            ai_response = get_ai_response(user_text, system_prompt)
-            print(f"🤖 Robot: {ai_response}")
-            update_gui("SPEAKING", user_text=user_text, robot_text=ai_response)
-
-            # Step D: Text-to-Speech
-            # Bug Fix #4: Safely run async TTS — avoid RuntimeError if loop already running
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(text_to_speech(ai_response))
-                else:
-                    loop.run_until_complete(text_to_speech(ai_response))
-            except RuntimeError:
-                asyncio.run(text_to_speech(ai_response))
-
-            # Step E: Play Audio
-            play_audio(RESPONSE_AUDIO)
-            time.sleep(0.5)  # Allow ALSA driver to release soundcard locks
-            update_gui("IDLE", user_text=user_text, robot_text=ai_response)
-
-        except KeyboardInterrupt:
-            print("\nExiting ShongiBot...")
-            break
-        except Exception as e:
-            print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
     if sys.stdin.isatty():
@@ -402,22 +512,22 @@ if __name__ == "__main__":
             current_pid = str(os.getpid())
             other_pids = [p for p in pids if p != current_pid]
             if other_pids:
-                print("\n⚠️ NOTICE: ShongiBot is currently running as a background service (robot.service).")
-                print("👉 To run manually with interactive GUI, stop the background service first:")
+                print("\n\u26a0\ufe0f NOTICE: ShongiBot is currently running as a background service (robot.service).")
+                print("\U0001f449 To run manually, stop the service first:")
                 print("   sudo systemctl stop robot.service\n")
         except Exception:
             pass
 
     enable_gui = "--no-gui" not in sys.argv and os.getenv("ENABLE_GUI", "true").lower() in ("true", "1", "yes")
     fullscreen = "--windowed" not in sys.argv
-    
+
     if enable_gui:
         try:
             import desk_buddy_gui
-            print("📺 Launching ShongiBot 3-Eye Desk Buddy GUI...")
+            print("\U0001f4fa Launching ShongiBot 3-Eye Desk Buddy GUI...")
             desk_buddy_gui.start_gui_in_main_thread(main, fullscreen=fullscreen)
         except Exception as e:
-            print(f"⚠️ GUI Launch info: {e}. Running in console mode.")
+            print(f"\u26a0\ufe0f GUI Launch info: {e}. Running in console mode.")
             main()
     else:
         main()
