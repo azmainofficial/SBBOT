@@ -72,22 +72,31 @@ def main():
             if line.startswith("GROQ_API_KEY") or line.startswith("GROQ_MODEL"):
                 print(f"   {line}")
 
-        # Ensure USB webcam driver is fix-configured (prevent option driver collision)
+        # Update system packages and install dependencies (flac, portaudio, dev tools for compiling PyAudio)
+        print("\n[APT] Updating apt package index and installing system dependencies (this might take a minute)...")
+        # Run apt-get update
+        client.exec_command(f"echo {PI_PASS} | sudo -S apt-get update -y > /dev/null 2>&1")
+        # Install flac, portaudio19-dev, python3-pyaudio, python3-venv, and libasound2-dev
+        stdin, stdout, stderr = client.exec_command(f"echo {PI_PASS} | sudo -S apt-get install -y flac portaudio19-dev python3-pyaudio python3-venv python3-dev libasound2-dev > /dev/null 2>&1")
+        stdout.channel.recv_exit_status() # Wait for completion
+
+        # Ensure USB webcam driver is configured (prevent option driver collision)
         client.exec_command(f"echo {PI_PASS} | sudo -S sh -c 'echo \"blacklist option\" > /etc/modprobe.d/blacklist-option.conf'")
         client.exec_command(f"echo {PI_PASS} | sudo -S modprobe -r option > /dev/null 2>&1")
         client.exec_command(f"echo {PI_PASS} | sudo -S modprobe uvcvideo > /dev/null 2>&1")
         client.exec_command(f"echo {PI_PASS} | sudo -S modprobe snd-usb-audio > /dev/null 2>&1")
 
-        # Ensure flac system dependency is installed for Google SpeechRecognition
-        client.exec_command(f"echo {PI_PASS} | sudo -S apt-get install -y flac > /dev/null 2>&1")
+        # Setup python virtual environment if missing
+        print("\n[VENV] Checking python virtual environment on Pi...")
+        stdin, stdout, stderr = client.exec_command(f"cd {REMOTE_DIR} && if [ ! -d venv ]; then python3 -m venv venv && ./venv/bin/pip install --upgrade pip; fi")
+        stdout.channel.recv_exit_status() # Wait for completion
 
-        # Check/install requirements in remote venv if needed
-        print("\n[REQS] Verifying Python requirements on Pi...")
-        stdin, stdout, stderr = client.exec_command(
-            f"cd {REMOTE_DIR} && if [ -d venv ]; then ./venv/bin/pip install -r requirements.txt; else pip3 install -r requirements.txt; fi"
-        )
+        # Check/install requirements in remote venv
+        print("[REQS] Installing/Verifying Python requirements on Pi...")
+        stdin, stdout, stderr = client.exec_command(f"cd {REMOTE_DIR} && ./venv/bin/pip install -r requirements.txt")
         req_out = stdout.read().decode('utf-8', errors='ignore')
         print(req_out if req_out else "Requirements check completed.")
+
 
         # 1. Disable boot run (robot.service) so it does not auto-start on boot
         print("\n[DISABLE-BOOT] Disabling and stopping robot.service...")

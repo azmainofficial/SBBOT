@@ -43,33 +43,51 @@ RESPONSE_AUDIO = "output.mp3"
 SAMPLE_RATE = 44100  # 44.1 kHz sample rate for USB camera/audio mics
 
 def play_audio(file_path):
-    """Auto-detects and routes sound to USB Speaker or 3.5mm Headphone Jack.
-    On Linux/Raspberry Pi: uses amixer + mpg123 with device auto-detection.
-    On Windows (dev mode): uses the default system player.
+    """Plays audio response.
+    On Linux/Raspberry Pi: Automatically routes to the default system audio output
+    (including connected Bluetooth speakers, HDMI, or USB speakers) via cvlc or ffplay.
+    On Windows/macOS: Natively uses default system media players.
     """
-    # Bug Fix #3: Guard Linux-only commands so Windows dev runs don't crash
     if sys.platform.startswith("linux"):
+        # Unmute core channels
         os.system("amixer -c 0 sset PCM 100% unmute > /dev/null 2>&1")
         os.system("amixer -c 1 sset Speaker 100% unmute > /dev/null 2>&1")
 
-        aplay_output = subprocess.getoutput("aplay -l")
+        # 1. First priority: cvlc (VLC) - extremely reliable, handles MP3,
+        # and automatically routes to default PipeWire/PulseAudio sinks (Bluetooth)
+        if os.system("which cvlc > /dev/null 2>&1") == 0:
+            os.system(f"cvlc --play-and-exit -q {file_path}")
+            return
 
-        if "USB Audio" in aplay_output or "Device [USB" in aplay_output:
-            print("🔊 Playing through USB Audio...")
-            os.system(f"mpg123 -a plughw:1,0 -q {file_path}")
-        elif "Headphones" in aplay_output:
-            print("🎧 Playing through 3.5mm Headphone Jack...")
-            os.system(f"mpg123 -a plughw:0,0 -q {file_path}")
-        else:
-            print("🔊 Playing through Default Output...")
-            os.system(f"mpg123 -q {file_path}")
+        # 2. Second priority: ffplay (FFmpeg player)
+        if os.system("which ffplay > /dev/null 2>&1") == 0:
+            os.system(f"ffplay -nodisp -autoexit -loglevel quiet {file_path}")
+            return
+
+        # 3. Third priority: mpg123 fallback
+        if os.system("which mpg123 > /dev/null 2>&1") == 0:
+            aplay_output = subprocess.getoutput("aplay -l")
+            if "USB Audio" in aplay_output or "Device [USB" in aplay_output:
+                print("🔊 Playing through USB Audio...")
+                os.system(f"mpg123 -a plughw:1,0 -q {file_path}")
+            elif "Headphones" in aplay_output:
+                print("🎧 Playing through 3.5mm Headphone Jack...")
+                os.system(f"mpg123 -a plughw:0,0 -q {file_path}")
+            else:
+                print("🔊 Playing through Default Output...")
+                os.system(f"mpg123 -q {file_path}")
+            return
+
+        # 4. Final fallback: aplay (only if we convert it, but let's notify user)
+        print("⚠️ Warning: No suitable command line player (cvlc, ffplay, mpg123) found on Pi.")
     elif sys.platform == "darwin":
         # macOS fallback
         os.system(f"afplay {file_path}")
     else:
-        # Windows fallback — use built-in start command
+        # Windows fallback
         print("🔊 Playing through Windows Default Audio...")
         os.system(f'start /min "" "{file_path}"')
+
 
 def record_audio(max_duration=10, silence_timeout=0.8):
     """Dynamically listens to mic: starts recording when user speaks and stops automatically after silence."""
