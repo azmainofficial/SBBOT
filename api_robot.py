@@ -275,171 +275,12 @@ def update_gui(state, user_text="", robot_text=""):
             desk_buddy_gui.gui_instance.set_state(state, user_text, robot_text)
     except Exception:
         pass
-
-
-# ─── Concurrent Pipeline ───────────────────────────────────────────────────────
-# audio_queue: recorder thread → processor thread
-# Each item is a numpy int16 array of the recorded utterance.
-audio_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
-
-# Shared flag: True while the bot is playing a response.
-# Recorder checks this to avoid capturing the bot's own voice.
-is_speaking = threading.Event()
-
-
-def recorder_worker(has_mic: bool):
-    """
-    Thread-1: Continuously listens for speech and pushes audio arrays
-    into audio_queue. Runs independently from the processor.
-    """
-    print("🎙️  [Recorder] Pipeline recorder started.")
-    while True:
-        try:
-            if not has_mic:
-                # No mic — text mode handled entirely in processor
-                time.sleep(0.5)
-                continue
-
-            # Wait while bot is speaking to avoid self-echo
-            while is_speaking.is_set():
-                time.sleep(0.05)
-
-            update_gui("LISTENING")
-            rms_energy = record_audio(max_duration=10, silence_timeout=0.8)
-
-            if rms_energy <= 0.0:
-                update_gui("IDLE")
-                time.sleep(0.05)
-                continue
-
-            # Load the audio that was just saved by record_audio()
-            try:
-                from scipy.io.wavfile import read as wav_read
-                _, audio_arr = wav_read(AUDIO_FILE)
-                # Put a copy into the queue (non-blocking — drop if full)
-                audio_queue.put_nowait(audio_arr.copy())
-                print("🎤  [Recorder] Audio captured → queued for processing.")
-            except queue.Full:
-                print("⚠️  [Recorder] Queue full — dropping utterance (processor busy).")
-            except Exception as e:
-                print(f"❌  [Recorder] Audio read error: {e}")
-
-        except Exception as e:
-            print(f"❌  [Recorder] Error: {e}")
-            time.sleep(0.2)
-
-
-def processor_worker(system_prompt: str, has_mic: bool):
-    """
-    Thread-2: Pulls audio arrays from audio_queue, runs STT → AI → TTS → play.
-    Runs concurrently with the recorder so recording continues during AI processing.
-    """
-    print("🧠  [Processor] Pipeline processor started.")
-    turn_index = 0
-
-    while True:
-        try:
-            if not has_mic:
-                # Text-input fallback when no microphone
-                if sys.stdin.isatty():
-                    user_text = input("\n👉 Type your message: ").strip()
-                    if not user_text:
-                        continue
-                else:
-                    time.sleep(10)
-                    continue
-            else:
-                # Block until recorder puts an audio chunk in the queue
-                try:
-                    audio_arr = audio_queue.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-
-                # Step B: Save array to temp WAV and transcribe
-                turn_wav = f"input_turn_{turn_index % 4}.wav"
-                write(turn_wav, SAMPLE_RATE, audio_arr)
-
-                update_gui("THINKING")
-                # Temporarily swap AUDIO_FILE path for transcription
-                orig = globals().get("AUDIO_FILE", "input.wav")
-                import builtins
-                # Transcribe from the per-turn file
-                try:
-                    import speech_recognition as sr
-                    r = sr.Recognizer()
-                    print("⚡  [Processor] Transcribing...")
-                    with sr.AudioFile(turn_wav) as source:
-                        audio = r.record(source)
-                    user_text = ""
-                    try:
-                        user_text = r.recognize_google(audio, language="bn-BD")
-                    except sr.UnknownValueError:
-                        pass
-                    if not user_text:
-                        try:
-                            user_text = r.recognize_google(audio, language="en-US")
-                        except sr.UnknownValueError:
-                            pass
-                except Exception as e:
-                    print(f"❌  [Processor] STT error: {e}")
-                    user_text = ""
-
-                if not user_text:
-                    print("❓  [Processor] Nothing transcribed — discarding.")
-                    update_gui("IDLE")
-                    audio_queue.task_done()
-                    continue
-
-            print(f"🗣️  User: {user_text}")
-            update_gui("THINKING", user_text=user_text)
-
-            # Step C: AI response
-            provider_name = "Groq" if API_PROVIDER == "groq" else "Grok"
-            print(f"🧠  [Processor] Querying {provider_name} ({MODEL})...")
-            ai_response = get_ai_response(user_text, system_prompt)
-            print(f"🤖  ShongiBot: {ai_response}")
-            update_gui("SPEAKING", user_text=user_text, robot_text=ai_response)
-
-            # Step D: TTS — use per-turn output file to avoid racing with next turn
-            response_file = f"output_turn_{turn_index % 4}.mp3"
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        pool.submit(asyncio.run, text_to_speech(ai_response, response_file)).result()
-                else:
-                    loop.run_until_complete(text_to_speech(ai_response, response_file))
-            except RuntimeError:
-                asyncio.run(text_to_speech(ai_response, response_file))
-
-            # Step E: Play — signal recorder to pause during playback
-            is_speaking.set()
-            play_audio(response_file)
-            time.sleep(0.4)
-            is_speaking.clear()   # ← recorder resumes immediately after playback
-
-            update_gui("IDLE", user_text=user_text, robot_text=ai_response)
-            turn_index += 1
-
-            if has_mic:
-                audio_queue.task_done()
-
-        except KeyboardInterrupt:
-            print("\n[Processor] Stopping...")
-            break
-        except Exception as e:
-            print(f"❌  [Processor] Error: {e}")
-            time.sleep(0.1)
-
-
 def main():
     print("=" * 55)
     provider_name = "Groq" if API_PROVIDER == "groq" else "Grok"
-    print(f"🤖 ShongiBot {provider_name} Concurrent Pipeline Active! (Model: {MODEL})")
-    print("   Thread-1 records  ──→  Queue  ──→  Thread-2 answers")
+    print(f"🤖 ShongiBot {provider_name} Sequential Active! (Model: {MODEL})")
+    print("   Listen (8s max) ➔ Think ➔ Respond ➔ Repeat")
     print("=" * 55)
-
 
     system_prompt = os.getenv(
         "SYSTEM_PROMPT",
@@ -480,29 +321,75 @@ def main():
 
     update_gui("IDLE")
 
-    # ── Launch concurrent pipeline threads ──────────────────────────────────
-    rec_thread = threading.Thread(
-        target=recorder_worker,
-        args=(has_mic,),
-        name="ShongiBot-Recorder",
-        daemon=True
-    )
-    proc_thread = threading.Thread(
-        target=processor_worker,
-        args=(system_prompt, has_mic),
-        name="ShongiBot-Processor",
-        daemon=True
-    )
+    while True:
+        try:
+            user_text = ""
 
-    rec_thread.start()
-    proc_thread.start()
-    print("\u2705  Both pipeline threads running. Ctrl+C to exit.")
+            if not has_mic:
+                # Text-input mode when no mic is available
+                if sys.stdin.isatty():
+                    user_text = input("\n👉 Type your message: ").strip()
+                    if not user_text:
+                        continue
+                else:
+                    time.sleep(5)
+                    continue
+            else:
+                if not ALWAYS_ON_MIC and sys.stdin.isatty():
+                    input("\n👉 Press ENTER to start talking...")
 
-    try:
-        while rec_thread.is_alive() and proc_thread.is_alive():
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("\n\U0001f6d1 ShongiBot shutting down...")
+                # Step A: Listen for 8s (max_duration=8)
+                update_gui("LISTENING")
+                rms_energy = record_audio(max_duration=8, silence_timeout=0.8)
+                if rms_energy <= 0.0:
+                    update_gui("IDLE")
+                    time.sleep(0.1)
+                    continue
+
+                # Step B: Speech-to-Text
+                update_gui("THINKING")
+                user_text = transcribe_audio()
+
+                if not user_text:
+                    print("❓ Nothing transcribed. Listening again...")
+                    update_gui("IDLE")
+                    continue
+
+            print(f"🗣️ User: {user_text}")
+            update_gui("THINKING", user_text=user_text)
+
+            # Step C: Get AI response
+            provider_name = "Groq" if API_PROVIDER == "groq" else "Grok"
+            print(f"🧠 Querying {provider_name} ({MODEL})...")
+            ai_response = get_ai_response(user_text, system_prompt)
+            print(f"🤖 ShongiBot: {ai_response}")
+            update_gui("SPEAKING", user_text=user_text, robot_text=ai_response)
+
+            # Step D: Text-to-Speech
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        pool.submit(asyncio.run, text_to_speech(ai_response, RESPONSE_AUDIO)).result()
+                else:
+                    loop.run_until_complete(text_to_speech(ai_response, RESPONSE_AUDIO))
+            except RuntimeError:
+                asyncio.run(text_to_speech(ai_response, RESPONSE_AUDIO))
+
+            # Step E: Play Response
+            play_audio(RESPONSE_AUDIO)
+            time.sleep(0.5)  # Let sound drivers release card locks
+
+            update_gui("IDLE", user_text=user_text, robot_text=ai_response)
+
+        except KeyboardInterrupt:
+            print("\nExiting ShongiBot...")
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            time.sleep(0.2)
+
 
 
 if __name__ == "__main__":
